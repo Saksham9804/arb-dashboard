@@ -1,2 +1,4 @@
 ccxt==4.3.89
 python-dotenv==1.0.1
+flask
+flask-cors
