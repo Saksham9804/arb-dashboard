@@ -7,7 +7,6 @@ import {
 const API = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 const WS  = API.replace(/^http/, 'ws') + '/ws';
 
-// ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
   bg:      '#050508',
   surface: '#0d0d14',
@@ -106,7 +105,6 @@ const css = `
   .mono { font-family: 'Space Mono', monospace; }
 `;
 
-// ── Custom tooltip ────────────────────────────────────────────────────────────
 const ChartTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   return (
@@ -121,12 +119,19 @@ const ChartTooltip = ({ active, payload, label }) => {
   );
 };
 
-// ── Main App ──────────────────────────────────────────────────────────────────
+const DEFAULT_SUMMARY = {
+  total_trades: 0,
+  total_profit_usdt: 0,
+  win_rate: 0,
+  trades_24h: 0,
+  profit_24h: 0,
+};
+
 export default function App() {
-  const [summary, setSummary]   = useState({ total_trades:0, total_profit_usdt:0, win_rate:0, trades_24h:0, profit_24h:0 });
-  const [trades, setTrades]     = useState([]);
-  const [chart, setChart]       = useState([]);
-  const [tickers, setTickers]   = useState({});
+  const [summary, setSummary]     = useState(DEFAULT_SUMMARY);
+  const [trades, setTrades]       = useState([]);
+  const [chart, setChart]         = useState([]);
+  const [tickers, setTickers]     = useState({});
   const [connected, setConnected] = useState(false);
   const wsRef = useRef(null);
 
@@ -137,68 +142,81 @@ export default function App() {
         fetch(`${API}/api/trades?limit=50`).then(r => r.json()),
         fetch(`${API}/api/profit-chart`).then(r => r.json()),
       ]);
-      setSummary(s);
-      setTrades(t);
-      setChart(c);
+      setSummary({ ...DEFAULT_SUMMARY, ...s });
+      setTrades(Array.isArray(t) ? t : []);
+      setChart(Array.isArray(c) ? c : []);
     } catch(e) { /* silently fail */ }
   }, []);
 
-  // WebSocket for live updates
   useEffect(() => {
     const connect = () => {
       try {
         const ws = new WebSocket(WS);
         wsRef.current = ws;
         ws.onopen  = () => setConnected(true);
-        ws.onclose = () => { setConnected(false); setTimeout(connect, 3000); };
+        ws.onerror = () => { try { ws.close(); } catch(e) {} };
+        ws.onclose = () => { setConnected(false); setTimeout(connect, 5000); };
         ws.onmessage = (e) => {
-          const msg = JSON.parse(e.data);
-          if (msg.type === 'trade') {
-            setTrades(prev => [msg.data, ...prev].slice(0, 50));
-            setSummary(prev => ({
-              ...prev,
-              total_trades: prev.total_trades + 1,
-              total_profit_usdt: +(prev.total_profit_usdt + msg.data.profit_usdt).toFixed(4),
-            }));
-            setChart(prev => [...prev, {
-              time: new Date(msg.data.timestamp * 1000).toLocaleTimeString(),
-              profit: +(prev.reduce((a,b)=>a+(b.trade_profit||0),0) + msg.data.profit_usdt).toFixed(4),
-              trade_profit: msg.data.profit_usdt,
-              symbol: msg.data.symbol,
-            }].slice(-100));
-          }
-          if (msg.type === 'tick') {
-            const d = msg.data;
-            setTickers(prev => ({ ...prev, [d.symbol]: d }));
-          }
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'trade') {
+              const d = msg.data;
+              setTrades(prev => [d, ...prev].slice(0, 50));
+              setSummary(prev => ({
+                ...prev,
+                total_trades: (prev.total_trades || 0) + 1,
+                total_profit_usdt: +((prev.total_profit_usdt || 0) + (d.profit_usdt || 0)).toFixed(4),
+              }));
+              setChart(prev => {
+                const cumulative = (prev[prev.length - 1]?.profit || 0) + (d.profit_usdt || 0);
+                return [...prev, {
+                  time: new Date((d.timestamp || Date.now() / 1000) * 1000).toLocaleTimeString(),
+                  profit: +cumulative.toFixed(4),
+                  trade_profit: d.profit_usdt || 0,
+                  symbol: d.symbol || '',
+                }].slice(-100);
+              });
+            }
+            if (msg.type === 'tick') {
+              const d = msg.data;
+              setTickers(prev => ({ ...prev, [d.symbol]: d }));
+            }
+          } catch(e) {}
         };
       } catch(e) {}
     };
     connect();
     fetchAll();
     const interval = setInterval(fetchAll, 30000);
-    return () => { clearInterval(interval); wsRef.current?.close(); };
+    return () => { clearInterval(interval); try { wsRef.current?.close(); } catch(e) {} };
   }, [fetchAll]);
 
   const fmtTime = (ts) => {
-    const d = new Date(ts * 1000);
-    return d.toLocaleTimeString('en-IN', { hour12: false });
+    try {
+      return new Date((ts || 0) * 1000).toLocaleTimeString('en-IN', { hour12: false });
+    } catch(e) { return ''; }
   };
 
-  const fmtProfit = (v) => (
-    <span className={v >= 0 ? 'profit-pos' : 'profit-neg'}>
-      {v >= 0 ? '+' : ''}{v.toFixed(4)} USDT
-    </span>
-  );
+  const fmtProfit = (v) => {
+    const val = v || 0;
+    return (
+      <span className={val >= 0 ? 'profit-pos' : 'profit-neg'}>
+        {val >= 0 ? '+' : ''}{val.toFixed(4)} USDT
+      </span>
+    );
+  };
 
-  // Spread color for bar chart
-  const spreadColor = (spread) => spread > 0.3 ? C.accent : spread > 0.1 ? '#ffcc00' : C.muted;
+  const spreadColor = (spread) => (spread || 0) > 0.3 ? C.accent : (spread || 0) > 0.1 ? '#ffcc00' : C.muted;
+
+  const totalProfit = summary.total_profit_usdt || 0;
+  const winRate     = summary.win_rate || 0;
+  const profit24h   = summary.profit_24h || 0;
 
   const statCards = [
-    { label: 'Total Profit', value: `${summary.total_profit_usdt >= 0 ? '+' : ''}${summary.total_profit_usdt.toFixed(4)}`, sub: 'USDT', accent: C.accent },
-    { label: 'Total Trades', value: summary.total_trades, sub: 'executions', accent: C.accent3 },
-    { label: 'Win Rate', value: `${summary.win_rate}%`, sub: 'profitable', accent: '#ffcc00' },
-    { label: '24h Trades', value: summary.trades_24h, sub: `${summary.profit_24h >= 0 ? '+' : ''}${summary.profit_24h?.toFixed(4)} USDT`, accent: C.accent2 },
+    { label: 'Total Profit', value: `${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(4)}`, sub: 'USDT', accent: C.accent },
+    { label: 'Total Trades', value: summary.total_trades || 0, sub: 'executions', accent: C.accent3 },
+    { label: 'Win Rate', value: `${winRate}%`, sub: 'profitable', accent: '#ffcc00' },
+    { label: '24h Trades', value: summary.trades_24h || 0, sub: `${profit24h >= 0 ? '+' : ''}${profit24h.toFixed(4)} USDT`, accent: C.accent2 },
   ];
 
   return (
@@ -207,7 +225,6 @@ export default function App() {
       <div className="grid-bg" />
       <div className="app">
 
-        {/* Header */}
         <div className="header">
           <div className="logo">ARB<span>.</span>BOT</div>
           <div style={{ fontSize: 13, color: C.muted }}>
@@ -216,7 +233,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Stats */}
         <div className="stats-row">
           {statCards.map((c, i) => (
             <div className="stat-card" key={i} style={{ '--accent-color': c.accent }}>
@@ -227,21 +243,19 @@ export default function App() {
           ))}
         </div>
 
-        {/* Live tickers */}
         {Object.keys(tickers).length > 0 && (
           <div className="live-ticker">
             {Object.entries(tickers).map(([sym, tick]) => (
-              <div key={sym} className={`ticker-chip ${Math.abs(tick.spread_pct) > 0.1 ? 'active' : ''}`}>
+              <div key={sym} className={`ticker-chip ${Math.abs(tick.spread_pct || 0) > 0.1 ? 'active' : ''}`}>
                 <div className="ticker-sym">{sym}</div>
-                <div className={`ticker-spread ${tick.spread_pct > 0 ? 'pos' : 'neg'}`}>
-                  {tick.spread_pct > 0 ? '+' : ''}{tick.spread_pct.toFixed(3)}%
+                <div className={`ticker-spread ${(tick.spread_pct || 0) > 0 ? 'pos' : 'neg'}`}>
+                  {(tick.spread_pct || 0) > 0 ? '+' : ''}{(tick.spread_pct || 0).toFixed(3)}%
                 </div>
               </div>
             ))}
           </div>
         )}
 
-        {/* Charts */}
         <div className="charts-row">
           <div className="panel">
             <div className="panel-title">Cumulative Profit (USDT)</div>
@@ -271,7 +285,7 @@ export default function App() {
                 <Tooltip content={<ChartTooltip />} />
                 <Bar dataKey="trade_profit" name="Profit" radius={[3,3,0,0]}>
                   {chart.slice(-30).map((entry, i) => (
-                    <Cell key={i} fill={entry.trade_profit >= 0 ? C.accent : C.accent2} fillOpacity={0.8} />
+                    <Cell key={i} fill={(entry.trade_profit || 0) >= 0 ? C.accent : C.accent2} fillOpacity={0.8} />
                   ))}
                 </Bar>
               </BarChart>
@@ -279,7 +293,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Trade log */}
         <div className="panel">
           <div className="panel-title">Trade Log</div>
           {trades.length === 0 ? (
@@ -298,15 +311,15 @@ export default function App() {
                     <tr key={i} className="trade-row">
                       <td style={{ color: C.muted }}>{fmtTime(t.timestamp)}</td>
                       <td style={{ color: C.text, fontWeight: 700 }}>{t.symbol}</td>
-                      <td>{t.buy_exchange} <span style={{ color: C.muted }}>@ {t.buy_price.toFixed(4)}</span></td>
-                      <td>{t.sell_exchange} <span style={{ color: C.muted }}>@ {t.sell_price.toFixed(4)}</span></td>
+                      <td>{t.buy_exchange} <span style={{ color: C.muted }}>@ {(t.buy_price || 0).toFixed(4)}</span></td>
+                      <td>{t.sell_exchange} <span style={{ color: C.muted }}>@ {(t.sell_price || 0).toFixed(4)}</span></td>
                       <td>
                         <div className="spread-bar">
-                          <div className="spread-fill" style={{ width: `${Math.min(t.spread_pct * 30, 60)}px`, background: spreadColor(t.spread_pct) }} />
-                          <span style={{ color: spreadColor(t.spread_pct) }}>{t.spread_pct.toFixed(3)}%</span>
+                          <div className="spread-fill" style={{ width: `${Math.min((t.spread_pct || 0) * 30, 60)}px`, background: spreadColor(t.spread_pct) }} />
+                          <span style={{ color: spreadColor(t.spread_pct) }}>{(t.spread_pct || 0).toFixed(3)}%</span>
                         </div>
                       </td>
-                      <td>{t.qty.toFixed(4)}</td>
+                      <td>{(t.qty || 0).toFixed(4)}</td>
                       <td>{fmtProfit(t.profit_usdt)}</td>
                       <td><span className={`badge badge-${t.dry_run ? 'dry' : 'live'}`}>{t.dry_run ? 'DRY' : 'LIVE'}</span></td>
                     </tr>
