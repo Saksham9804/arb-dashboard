@@ -53,7 +53,7 @@ class Config:
     FEE_B: float = 0.0   # WazirX: 0% promo fee (revert to 0.2 when normal fees resume)
 
     # ── Strategy ─────────────────────────────────────────────────────────
-    MIN_SPREAD_PCT: float = 0.3   # lower from 0.3 to 0.05
+    MIN_SPREAD_PCT: float = 1.5   # lower from 0.3 to 0.05
 
     # ── Trade sizing ─────────────────────────────────────────────────────
     MAX_TRADE_FRACTION: float = 0.95
