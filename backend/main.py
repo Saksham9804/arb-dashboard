@@ -7,14 +7,13 @@ import os, json, asyncio, time
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import uvicorn
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///arb_bot.db")
 
-# Railway Postgres URLs start with postgres:// — SQLAlchemy needs postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -32,7 +31,7 @@ class Trade(SQLModel, table=True):
     buy_price: float
     sell_price: float
     spread_pct: float
-    qty: float
+    qty: float = 0.0
     profit_usdt: float
     dry_run: bool = True
 
@@ -61,7 +60,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
         self.active: list[WebSocket] = []
@@ -71,7 +69,8 @@ class ConnectionManager:
         self.active.append(ws)
 
     def disconnect(self, ws: WebSocket):
-        self.active.remove(ws)
+        if ws in self.active:
+            self.active.remove(ws)
 
     async def broadcast(self, data: dict):
         dead = []
@@ -81,12 +80,17 @@ class ConnectionManager:
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self.active.remove(ws)
+            if ws in self.active:
+                self.active.remove(ws)
 
 manager = ConnectionManager()
 
 
 # ── REST endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "time": time.time()}
 
 @app.get("/api/summary")
 def summary():
@@ -118,7 +122,6 @@ def get_prices(limit: int = 200):
 
 @app.get("/api/profit-chart")
 def profit_chart():
-    """Cumulative profit over time for the chart."""
     with Session(engine) as s:
         trades = s.exec(select(Trade).order_by(Trade.timestamp)).all()
         cumulative = 0.0
@@ -133,27 +136,48 @@ def profit_chart():
             })
         return points
 
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "time": time.time()}
 
-
-# ── WebSocket for live updates ────────────────────────────────────────────────
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await manager.connect(ws)
     try:
         while True:
-            await ws.receive_text()   # keep alive
+            await ws.receive_text()
     except WebSocketDisconnect:
+        manager.disconnect(ws)
+    except Exception:
         manager.disconnect(ws)
 
 
-# ── Called by bot to record events ───────────────────────────────────────────
+# ── Bot posting endpoints ─────────────────────────────────────────────────────
 
 @app.post("/api/trade")
 async def record_trade(trade: Trade):
+    with Session(engine) as s:
+        s.add(trade)
+        s.commit()
+        s.refresh(trade)
+    await manager.broadcast({"type": "trade", "data": trade.model_dump()})
+    return {"ok": True}
+
+@app.post("/api/post-trade")
+async def post_trade_compat(request: Request):
+    """Compatibility endpoint — bot.py posts here."""
+    data = await request.json()
+    trade = Trade(
+        timestamp=data.get("time", time.time()),
+        symbol=data.get("symbol", ""),
+        buy_exchange=data.get("buy_exchange", ""),
+        sell_exchange=data.get("sell_exchange", ""),
+        buy_price=data.get("buy_price", 0.0),
+        sell_price=data.get("sell_price", 0.0),
+        spread_pct=data.get("spread", 0.0),
+        qty=data.get("qty", 0.0),
+        profit_usdt=data.get("profit", 0.0),
+        dry_run=data.get("dry_run", True),
+    )
     with Session(engine) as s:
         s.add(trade)
         s.commit()
@@ -171,4 +195,4 @@ async def record_tick(tick: PriceTick):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8080)), reload=False)
