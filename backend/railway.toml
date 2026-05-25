@@ -2,5 +2,5 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT & python bot.py"
-restartPolicyType = "always"
+startCommand = "python api.py & python bot.py"
+restartPolicyType = "on_failure"
