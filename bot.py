@@ -28,6 +28,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("arb_bot")
 
+# ── API endpoint for the dashboard ───────────────────────────────────────────
+API_URL = os.environ.get("API_URL", "http://localhost:8000")
+
 
 def _make_session() -> aiohttp.ClientSession:
     ssl_ctx   = ssl.create_default_context(cafile=_CA)
@@ -42,19 +45,10 @@ async def _noop_none(*a, **kw): return None
 
 
 async def _load_kucoin_spot_only(ex: ccxt.kucoin):
-    """
-    Load only KuCoin spot markets by directly fetching /api/v2/symbols
-    and injecting the result, bypassing load_markets() which calls
-    margin/isolated/leverage endpoints we don't have permission for.
-    """
-    # Fetch spot symbols directly
-    response = await ex.publicGetSymbols()           # GET /api/v2/symbols
-    # ccxt kucoin parses this via parse_markets
+    response = await ex.publicGetSymbols()
     raw_markets = response.get("data", [])
-
     markets = {}
     for m in raw_markets:
-        # Only keep active spot USDT pairs we care about
         if not m.get("enableTrading", False):
             continue
         base  = m.get("baseCurrency", "")
@@ -79,7 +73,6 @@ async def _load_kucoin_spot_only(ex: ccxt.kucoin):
             "info": m,
             "type": "spot",
         }
-
     ex.markets            = markets
     ex.markets_by_id      = {v["id"]: v for v in markets.values()}
     ex.symbols            = sorted(markets.keys())
@@ -141,6 +134,37 @@ class ArbitrageBot:
         self.total_profit_usdt = 0.0
         self._fail_counts: dict = {}
         self._common_symbols: list = []
+        self._api_session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_api_session(self) -> aiohttp.ClientSession:
+        if self._api_session is None or self._api_session.closed:
+            self._api_session = aiohttp.ClientSession()
+        return self._api_session
+
+    async def _post_trade_to_api(self, opp: ArbitrageOpportunity, profit: float, dry_run: bool):
+        """Post trade data to the dashboard API. Fails silently so bot keeps running."""
+        try:
+            session = await self._get_api_session()
+            payload = {
+                "symbol":       opp.symbol,
+                "buy_exchange":  opp.buy_exchange,
+                "sell_exchange": opp.sell_exchange,
+                "buy_price":    opp.buy_price,
+                "sell_price":   opp.sell_price,
+                "spread":       opp.spread_pct,
+                "profit":       profit,
+                "dry_run":      dry_run,
+                "time":         time.time(),
+            }
+            async with session.post(
+                f"{API_URL}/api/post-trade",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                if resp.status != 200:
+                    log.warning(f"API post returned {resp.status}")
+        except Exception as e:
+            log.debug(f"API post failed (non-critical): {e}")
 
     async def _close_all(self):
         for ex in [self.exchange_a, self.exchange_b]:
@@ -151,10 +175,11 @@ class ArbitrageBot:
                     await ex.close()
                 except Exception:
                     pass
+        if self._api_session and not self._api_session.closed:
+            await self._api_session.close()
         await asyncio.sleep(0.25)
 
     async def _load_markets(self):
-        # ── Exchange A (KuCoin special-cased) ────────────────────────────
         log.info(f"Loading {self.name_a} markets...")
         self.exchange_a = _make_exchange(self.name_a)
         if self.name_a == "kucoin":
@@ -163,7 +188,6 @@ class ArbitrageBot:
             await self.exchange_a.load_markets()
             log.info(f"  {self.name_a}: {len(self.exchange_a.markets)} markets loaded")
 
-        # ── Exchange B ───────────────────────────────────────────────────
         log.info(f"Loading {self.name_b} markets...")
         self.exchange_b = _make_exchange(self.name_b)
         if self.name_b == "kucoin":
@@ -236,7 +260,6 @@ class ArbitrageBot:
         sell_ex = self.exchange_a if opp.sell_exchange == self.name_a else self.exchange_b
 
         if config.DRY_RUN:
-            # In dry run, simulate with MAX_TRADE_USDT — no real balance needed
             trade_usdt = config.MAX_TRADE_USDT
         else:
             usdt_bal   = await self.get_usdt_balance(opp.buy_exchange)
@@ -250,17 +273,21 @@ class ArbitrageBot:
         log.info(f"[ARB] {opp.symbol} | Buy {opp.buy_exchange} @ {opp.buy_price:.4f} "
                  f"| Sell {opp.sell_exchange} @ {opp.sell_price:.4f} "
                  f"| Spread {opp.spread_pct:.3f}% | Qty {amount}")
+
         if config.DRY_RUN:
-            # In dry run, simulate with the configured max trade size
             if trade_usdt < config.MIN_TRADE_USDT:
                 trade_usdt = config.MAX_TRADE_USDT
                 amount = Decimal(str(trade_usdt / opp.buy_price)).quantize(
                     Decimal("0.0001"), rounding=ROUND_DOWN)
             profit = float(amount) * (opp.sell_price - opp.buy_price)
-            log.info(f"[DRY RUN] Simulated profit: {profit:.4f} USDT")
+            log.info(f"[DRY RUN] {opp.symbol} | Buy {opp.buy_exchange} @ {opp.buy_price} "
+                     f"| Sell {opp.sell_exchange} @ {opp.sell_price} "
+                     f"| Spread {opp.spread_pct:.3f}% | Profit {profit:.4f} USDT")
             self.trade_count += 1
             self.total_profit_usdt += profit
+            await self._post_trade_to_api(opp, profit, dry_run=True)
             return True
+
         try:
             buy_ord, sell_ord = await asyncio.gather(
                 buy_ex.create_market_buy_order(opp.symbol, float(amount)),
@@ -270,6 +297,7 @@ class ArbitrageBot:
             self.trade_count += 1
             self.total_profit_usdt += profit
             log.info(f"[OK] Buy {buy_ord['id']} | Sell {sell_ord['id']} | Profit {profit:.4f} USDT")
+            await self._post_trade_to_api(opp, profit, dry_run=False)
             return True
         except Exception as e:
             log.error(f"[FAIL] Trade failed: {e}")
