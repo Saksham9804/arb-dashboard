@@ -245,7 +245,7 @@ export default function App() {
 
         {Object.keys(tickers).length > 0 && (
           <div className="live-ticker">
-            {Object.entries(tickers).map(([sym, tick]) => (
+            {Object.entries(tickers).filter(([sym]) => sym && sym !== 'undefined').map(([sym, tick]) => (
               <div key={sym} className={`ticker-chip ${Math.abs(tick.spread_pct || 0) > 0.1 ? 'active' : ''}`}>
                 <div className="ticker-sym">{sym}</div>
                 <div className={`ticker-spread ${(tick.spread_pct || 0) > 0 ? 'pos' : 'neg'}`}>
